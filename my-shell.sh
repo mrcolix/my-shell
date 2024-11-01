@@ -88,6 +88,13 @@ echo "Installing basic dependencies..."
 $INSTALL_CMD git curl wget
 check_installation "git, curl, wget"
 
+# install fonts
+mkdir /tmp/fonts
+wget https://github.com/ryanoasis/nerd-fonts/releases/download/v3.0.2/Hack.zip -O /tmp/fonts/Hack.zip
+unzip /tmp/fonts/Hack.zip -d /tmp/fonts
+wget https://github.com/romkatv/powerlevel10k-media/raw/master/MesloLGS%20NF%20Regular.ttf -o /tmp/fonts/
+font-manager -i /tmp/fonts/*.ttf
+
 # Install zsh
 echo "Installing zsh..."
 $INSTALL_CMD zsh
@@ -96,6 +103,10 @@ check_installation "zsh"
 # Interactive handling of the .zshrc file
 echo "Handling .zshrc..."
 if handle_existing_file "$HOME/.zshrc"; then
+  # Remove existing .zshrc file
+  rm -rf "$HOME/.oh-my-zsh"
+  echo ".zshrc file removed."
+
   # Install Oh My Zsh (needed for plugins)
   echo "Installing Oh My Zsh..."
   yes | sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
@@ -125,9 +136,10 @@ fi
 # Install Powerlevel10k theme
 echo "Installing Powerlevel10k..."
 git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k
-cp ./config_files/p10k.zsh ~/.p10k.zsh
 rm -f ~/.p10k.zsh
-sed -i 's/^ZSH_THEME=".*"/ZSH_THEME="powerlevel10k/powerlevel10k"/' ~/.zshrc
+cp ./config_files/p10k.zsh ~/.p10k.zsh
+sed -i 's/^ZSH_THEME=".*"/ZSH_THEME="powerlevel10k\/powerlevel10k"/' ~/.zshrc
+echo ¨[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh¨ >> ~/.zshrc
 
 # Interactive handling of the .vimrc file
 echo "Handling .vimrc..."
