@@ -94,14 +94,8 @@ $INSTALL_CMD zsh
 check_installation "zsh"
 
 # Set zsh as the default shell
-chsh -s $(which zsh)
-echo "zsh is now the default shell."
-
-# Install Powerlevel10k theme
-echo "Installing Powerlevel10k..."
-git clone --depth=1 https://github.com/romkatv/powerlevel10k.git $HOME/.powerlevel10k
-echo 'source ~/.powerlevel10k/powerlevel10k.zsh-theme' >>~/.zshrc
-check_installation "Powerlevel10k"
+#chsh -s $(which zsh)
+#echo "zsh is now the default shell."
 
 # Interactive handling of the .zshrc file
 echo "Handling .zshrc..."
@@ -131,6 +125,13 @@ if handle_existing_file "$HOME/.zshrc"; then
 else
   echo "Operations on .zshrc canceled by user."
 fi
+
+# Install Powerlevel10k theme
+echo "Installing Powerlevel10k..."
+git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k
+cp ./config_files/p10k.zsh ~/.p10k.zsh
+sed -i 's/^ZSH_THEME=".*"/ZSH_THEME="powerlevel10k/powerlevel10k"/' ~/.zshrc
+else
 
 # Interactive handling of the .vimrc file
 echo "Handling .vimrc..."
