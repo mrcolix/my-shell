@@ -102,7 +102,7 @@ echo "Handling .zshrc..."
 if handle_existing_file "$HOME/.zshrc"; then
   # Install Oh My Zsh (needed for plugins)
   echo "Installing Oh My Zsh..."
-  sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+  yes | sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
   check_installation "Oh My Zsh"
   
   # Install zsh plugins (zsh-syntax-highlighting, zsh-autosuggestions)
@@ -130,8 +130,8 @@ fi
 echo "Installing Powerlevel10k..."
 git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k
 cp ./config_files/p10k.zsh ~/.p10k.zsh
+rm -f ~/.p10k.zsh
 sed -i 's/^ZSH_THEME=".*"/ZSH_THEME="powerlevel10k/powerlevel10k"/' ~/.zshrc
-else
 
 # Interactive handling of the .vimrc file
 echo "Handling .vimrc..."
