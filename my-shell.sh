@@ -54,23 +54,23 @@ function backup_file {
 # Identify the distribution and assign the correct package manager
 if [ -f /etc/debian_version ]; then
     # Debian/Ubuntu
-    PKG_MANAGER="sudo apt"
+    PKG_MANAGER="apt"
     UPDATE_CMD="sudo apt update -y"
     INSTALL_CMD="sudo apt install -y"
 elif [ -f /etc/redhat-release ]; then
     # RedHat/CentOS/Fedora
     if command -v dnf &>/dev/null; then
-        PKG_MANAGER="sudo dnf"
+        PKG_MANAGER="dnf"
         UPDATE_CMD="sudo dnf check-update -y"
         INSTALL_CMD="sudo dnf install -y"
     else
-        PKG_MANAGER="sudo yum"
+        PKG_MANAGER="yum"
         UPDATE_CMD="sudo yum check-update -y"
         INSTALL_CMD="sudo yum install -y"
     fi
 elif [ -f /etc/arch-release ]; then
     # Arch Linux
-    PKG_MANAGER="sudo pacman"
+    PKG_MANAGER="pacman"
     UPDATE_CMD="sudo pacman -Syu --noconfirm"
     INSTALL_CMD="sudo pacman -S --noconfirm"
 else
@@ -92,10 +92,6 @@ check_installation "git, curl, wget"
 echo "Installing zsh..."
 $INSTALL_CMD zsh
 check_installation "zsh"
-
-# Set zsh as the default shell
-#chsh -s $(which zsh)
-#echo "zsh is now the default shell."
 
 # Interactive handling of the .zshrc file
 echo "Handling .zshrc..."
@@ -120,7 +116,7 @@ if handle_existing_file "$HOME/.zshrc"; then
   echo "PROMPT='$(kube_ps1)'$PROMPT;kubeoff # or RPROMPT='$(kube_ps1)'" >> ~/.zshrc
 
   # Modify the .zshrc file to enable the plugins
-  echo "Configuring zsh..."
+  echo "Configuring zsh..."  
   sed -i 's/plugins=(git)/plugins=(git zsh-syntax-highlighting zsh-autosuggestions kube-ps1)/' ~/.zshrc
 else
   echo "Operations on .zshrc canceled by user."
