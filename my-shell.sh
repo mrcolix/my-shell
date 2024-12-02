@@ -88,25 +88,30 @@ echo "Installing basic dependencies..."
 $INSTALL_CMD git curl wget
 check_installation "git, curl, wget"
 
-# install fonts
-mkdir /tmp/fonts
-wget https://github.com/ryanoasis/nerd-fonts/releases/download/v3.0.2/Hack.zip -O /tmp/fonts/Hack.zip
-unzip /tmp/fonts/Hack.zip -d /tmp/fonts
-wget https://github.com/romkatv/powerlevel10k-media/raw/master/MesloLGS%20NF%20Regular.ttf -o /tmp/fonts/
-font-manager -i /tmp/fonts/*.ttf
+# Install fonts
+FONT_DIR="/usr/share/fonts"
+
+mkdir -p /tmp/fonts
+
+# Download and install Hack font from Nerd Fonts repository and MesloLGS NF Regular font.
+wget https://github.com/ryanoasis/nerd-fonts/releases/download/v3.0.2/Hack.zip -O /tmp/fonts/Hack.zip && \
+unzip /tmp/fonts/Hack.zip -d /tmp/fonts && \
+sudo mv /tmp/fonts/*.ttf $FONT_DIR && \
+sudo wget https://github.com/romkatv/powerlevel10k-media/raw/master/MesloLGS%20NF%20Regular.ttf -O $FONT_DIR/MesloLGS_NF_Regular.ttf && \
+fc-cache -f -v
 
 # Install zsh
 echo "Installing zsh..."
-$INSTALL_CMD zsh
+$INSTALL_CMD zsh 
 check_installation "zsh"
 
 # Interactive handling of the .zshrc file
 echo "Handling .zshrc..."
 if handle_existing_file "$HOME/.zshrc"; then
-  # Remove existing .zshrc file
-  rm -rf "$HOME/.oh-my-zsh"
-  echo ".zshrc file removed."
-
+  
+  # Remove existing .oh-my-zsh directory if it exists.
+  rm -rf "$HOME/.oh-my-zsh" && echo ".oh-my-zsh folder removed."
+  
   # Install Oh My Zsh (needed for plugins)
   echo "Installing Oh My Zsh..."
   yes | sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
@@ -133,25 +138,26 @@ else
   echo "Operations on .zshrc canceled by user."
 fi
 
-# Install Powerlevel10k theme
+# Install Powerlevel10k theme.
 echo "Installing Powerlevel10k..."
 git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k
 rm -f ~/.p10k.zsh
-cp ./config_files/p10k.zsh ~/.p10k.zsh
+cp ./config_files/p10k.zsh ~/.p10k.zsh 
 sed -i 's/^ZSH_THEME=".*"/ZSH_THEME="powerlevel10k\/powerlevel10k"/' ~/.zshrc
 echo "[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh" >> ~/.zshrc
 
-# Interactive handling of the .vimrc file
+# Interactive handling of the .vimrc file.
 echo "Handling .vimrc..."
 if handle_existing_file "$HOME/.vimrc"; then
-  # Install vim
+  
+  # Install vim.
   echo "Installing vim..."
   $INSTALL_CMD vim
   check_installation "vim"
   
-  # Customize vim settings
+# Customize vim settings.
   echo "Customizing vim..."
-  cat <<EOL >> ~/.vimrc
+cat <<EOL >> ~/.vimrc
 " Enable line numbers
 set number
 
@@ -170,9 +176,10 @@ set tabstop=4
 set shiftwidth=4
 set expandtab
 EOL
-else
-  echo "Operations on .vimrc canceled by user."
+
+else 
+   echo "Operations on .vimrc canceled by user."
 fi
 
-# Final message
+# Final message.
 echo "Installation complete! Restart the terminal or run 'source ~/.zshrc' to apply the changes."
