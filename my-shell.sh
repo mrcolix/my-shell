@@ -85,8 +85,8 @@ check_installation "System update"
 
 # Install basic dependencies
 echo "Installing basic dependencies..."
-$INSTALL_CMD git curl wget
-check_installation "git, curl, wget"
+$INSTALL_CMD git curl wget unzip 
+check_installation "git, curl, wget, unzip"
 
 # Install fonts
 FONT_DIR="/usr/share/fonts"
@@ -127,20 +127,21 @@ if handle_existing_file "$HOME/.zshrc"; then
   # Install zsh-autosuggestions
   git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
   check_installation "zsh-autosuggestions"
-  
-  # Installa kube-ps1
+
+  # Install kube-ps1 for Kubernetes context in prompt.
   echo "PROMPT='$(kube_ps1)'$PROMPT;kubeoff # or RPROMPT='$(kube_ps1)'" >> ~/.zshrc
 
-  # Modify the .zshrc file to enable the plugins
+  # Modify the .zshrc file to enable the plugins.
   echo "Configuring zsh..."  
   sed -i 's/plugins=(git)/plugins=(git zsh-syntax-highlighting zsh-autosuggestions kube-ps1)/' ~/.zshrc
-else
-  echo "Operations on .zshrc canceled by user."
+
+else 
+   echo "Operations on .zshrc canceled by user."
 fi
 
 # Install Powerlevel10k theme.
 echo "Installing Powerlevel10k..."
-git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k
+git clone --depth=1 https://github.com/romkatv/powerlevel10k.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k || { echo "Failed to install Powerlevel10k"; exit 1; }
 rm -f ~/.p10k.zsh
 cp ./config_files/p10k.zsh ~/.p10k.zsh 
 sed -i 's/^ZSH_THEME=".*"/ZSH_THEME="powerlevel10k\/powerlevel10k"/' ~/.zshrc
@@ -155,7 +156,7 @@ if handle_existing_file "$HOME/.vimrc"; then
   $INSTALL_CMD vim
   check_installation "vim"
   
-# Customize vim settings.
+  # Customize vim settings.
   echo "Customizing vim..."
 cat <<EOL >> ~/.vimrc
 " Enable line numbers
@@ -180,6 +181,40 @@ EOL
 else 
    echo "Operations on .vimrc canceled by user."
 fi
+
+# Install kubectl and oc using binaries.
+echo "Installing kubectl and oc..."
+
+KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+ARCH=amd64
+
+# Download and install kubectl binary.
+curl -LO "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$ARCH/kubectl" && \
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# Download and install oc binary.
+curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz && \
+tar xvf oc.tar.gz && \
+sudo mv oc /usr/local/bin/
+
+# Install kubectx binary.
+echo "Installing kubectx and kubens..."
+
+KUBECTX_VERSION=$(curl -s https://api.github.com/repos/ahmetb/kubectx/releases/latest | grep 'tag_name' | cut -d '"' -f 4)
+curl -LO https://github.com/ahmetb/kubectx/archive/refs/tags/${KUBECTX_VERSION}.tar.gz && \
+tar xvf ${KUBECTX_VERSION}.tar.gz && \
+sudo mv kubectx-*/* /usr/local/bin/ && \
+rm ${KUBECTX_VERSION}.tar.gz || { echo "Failed to install kubectx"; exit 1; }
+
+# Enable autocompletion for kubectl, oc, and kubectx.
+echo 'source <(kubectl completion zsh)' >> ~/.zshrc 
+echo 'source <(oc completion zsh)' >> ~/.zshrc 
+echo 'source <(kubectx completion zsh)' >> ~/.zshrc 
+
+# Setting Aliases
+echo 'alias k=kubectl' >> ~/.zshrc
+echo 'alias kns=kubens' >> ~/.zshrc
+echo 'alias kx=kubectx' >> ~/.zshrc
 
 # Final message.
 echo "Installation complete! Restart the terminal or run 'source ~/.zshrc' to apply the changes."
