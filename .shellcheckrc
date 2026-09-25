@@ -1,0 +1,6 @@
+# my-shell.sh is a sh/bash polyglot: a POSIX preamble installs bash if needed
+# and then hands the file over to it. Tell shellcheck to analyse the body as bash.
+shell=bash
+
+# config_files/ holds zsh and vim configuration, not shell scripts.
+source-path=SCRIPTDIR
