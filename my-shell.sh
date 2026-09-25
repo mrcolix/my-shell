@@ -832,6 +832,19 @@ backend_install() {  # backend_install <method> <arg>
 
     case "$method" in
         npm)
+            # A global npm install writes into npm's global prefix, which on most
+            # distributions is a root-owned directory. Running it anyway would
+            # either fail or stop the whole run on a password prompt the user
+            # never asked for, so check first and hand them the exact command.
+            local npm_prefix
+            npm_prefix=$(npm prefix -g 2>/dev/null) || npm_prefix=""
+            if [[ -n $npm_prefix && ! -w $npm_prefix ]]; then
+                log_warn "npm's global prefix is not writable: $npm_prefix"
+                log_warn "      set a user-level prefix, then re-run:"
+                log_warn "        npm config set prefix \"\$HOME/.local\""
+                log_warn "        npm install -g --no-fund --no-audit $arg"
+                return 1
+            fi
             # --no-fund/--no-audit keep the output short and avoid telemetry.
             log_info "npm install -g $arg"
             npm install -g --no-fund --no-audit "$arg"
