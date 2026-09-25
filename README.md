@@ -66,9 +66,12 @@ So a new workstation is a one-line diff, not a code change:
 A tool that cannot be installed on the current distribution is **reported and
 skipped**, never fatal — the manifest's `note` column says why.
 
-Nothing in the manifest needs `sudo` beyond the package manager, and the `ai`
-group (npm/official installers) is never selected by a default profile because it
-downloads and runs third-party code.
+Nothing in the manifest needs `sudo` beyond the package manager, with one
+exception: `npm install -g` writes to npm's global prefix, which is root-owned
+on most distributions. The script checks that first and, rather than stopping
+the run on a password prompt, prints the two commands to run yourself. The
+`ai` group is never selected by a default profile anyway, because both `npm`
+and `official` installers download and run third-party code.
 
 ## Supported distributions
 
@@ -98,10 +101,13 @@ Architectures: `x86_64`, `aarch64`, `armv7l`, `armv6l`, `i686`, `s390x`,
 
 ## Safety model
 
-The previous version of this script overwrote `~/.zshrc`, `rm -rf`'d
-`~/.oh-my-zsh`, duplicated a full Oh My Zsh install on distributions that ship
-one from a package, and referenced a `kube-ps1` plugin it never installed. Those
-are gone. The rules now are:
+The previous version of this script destroyed user configuration. Concretely,
+it deleted `~/.p10k.zsh` with `rm -f` and no prompt at all, `rm -rf`'d
+`~/.oh-my-zsh`, ran the Oh My Zsh installer unconditionally — duplicating an
+install that a distribution package already provides — and referenced a
+`kube-ps1` plugin it never installed. It also could not be scripted: on a
+non-TTY, `read -p` in its overwrite prompt returns nothing, so the `while true`
+around it looped forever. Those are gone. The rules now are:
 
 * **Nothing is overwritten silently.** For an existing dotfile you get
   `keep` / `backup` / `merge` / `cancel`. `--yes` and non-interactive runs pick
@@ -160,6 +166,10 @@ are gone. The rules now are:
 ```
 -n, --dry-run            print what would happen, change nothing
 -y, --yes                non-interactive
+-v, --verbose            extra diagnostics
+    --no-color           disable ANSI colours
+-h, --help               this text
+    --version            print the version and exit
     --only=a,b / --skip=a,b / --all
     --prompt=powerlevel10k|starship|none
     --fonts=both|meslo|hack|none       --font-dir=DIR   --font-version=vX.Y.Z
@@ -177,6 +187,8 @@ are gone. The rules now are:
     --kubectl-version=V --kubectx-version=V --stern-version=V
     --pkg-manager=NAME
 ```
+
+`--extras` with no value is shorthand for `--extras=daily`.
 
 ## Examples
 
