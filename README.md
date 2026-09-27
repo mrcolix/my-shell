@@ -11,6 +11,42 @@ declarative manifest of dev tools.
 
 ---
 
+## What it looks like
+
+The point of the script is what the terminal looks like afterwards, so here is a
+real run on a machine that had nothing: a vanilla `alpine:3.20` container with no
+`bash`, no `git`, no dotfiles, taken through
+`--all --extras=daily,k8s,terminal,secrets --yes`.
+
+It starts by working out what it is running on, from `/etc/os-release` alone,
+and says so before touching anything:
+
+![the run detecting the distribution, package manager, platform and target zsh config before changing anything](docs/screens/run-start.png)
+
+The Kubernetes section downloads each binary and checks its checksum. Where a
+publisher does not offer one, it says that instead of implying the download was
+verified:
+
+![the kubernetes section, sha256 verified per binary, with the oc mirror called out as unverified](docs/screens/k8s.png)
+
+And the prompt is the reason most people run this. Git branch and dirty count,
+the current cluster and namespace, Nerd Font glyphs, and the tools the manifest
+installed all rendering in colour:
+
+![the resulting zsh prompt: powerlevel10k with git, kubernetes context, nerd font icons, eza and bat output](docs/screens/prompt.png)
+
+The summary at the end accounts for every section, and the exit status is
+derived from it: all ten `done` here, so the run exited `0`. A section that
+could not finish is marked as such and the exit status becomes non-zero:
+
+![the run summary, all ten sections done](docs/screens/run-summary.png)
+
+> These are real captures, not mock-ups: the streams came from a real run in a
+> throwaway podman container. The demo repository and the `dev-box` hostname are
+> staged for the screenshot; everything the script printed is its own output.
+
+---
+
 ## What it does
 
 | Section   | What you get                                                                    |
@@ -329,6 +365,7 @@ config_files/p10k.zsh    Powerlevel10k configuration
 config_files/zshrc-omz   starter .zshrc, only used when none exists
 config_files/vimrc       vim configuration
 config_files/tools.conf  the tool manifest: groups, per-distro names, install method
+docs/screens/*.png       the screenshots above, captured from a real run
 ```
 
 `config_files/zshrc-omz` and `config_files/vimrc` are only installed when the
@@ -353,3 +390,25 @@ a `sh`/`bash` polyglot.
 awk -F'|' '!/^#/ && NF && NF != 7 {print NR": "NF" fields"}' config_files/tools.conf
 grep -vE '^#|^$' config_files/tools.conf | cut -d'|' -f1 | sort | uniq -d
 ```
+
+### The screenshots
+
+`docs/screens/*.png` are captures of a real run, not illustrations, and they go
+stale the moment the prompt changes. To refresh them, run the script in a
+throwaway container of a base image with nothing on it, and screenshot the
+terminal:
+
+```bash
+podman run -dit --name shot alpine:3.20 sleep infinity
+podman cp . shot:/root/my-shell
+podman exec -it -w /root/my-shell shot \
+  ./my-shell.sh --all --extras=daily,k8s,terminal,secrets --yes
+podman exec -it shot sh -c 'stty cols 100 rows 44; exec zsh -l'
+```
+
+Two things are worth keeping in mind if you do. The script only emits colour on
+a tty, so the run has to be captured through `podman exec -it` rather than
+redirected to a file — otherwise the screenshots come out monochrome. And the
+prompt needs a Nerd Font to read correctly: `fonts` installs MesloLGS NF into
+the container, but the *rendering* happens on whatever machine draws the
+screenshot, so that one needs the font installed too.
