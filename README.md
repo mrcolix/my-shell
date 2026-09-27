@@ -45,10 +45,19 @@ zoxide|daily|pkg|-|pacman=zoxide,apt=zoxide,dnf=zoxide,zypper=zoxide,apk=zoxide,
 ```
 
 * `group` — what `--extras=<group>` selects: `deps daily k8s terminal secrets gui ai`
-* `method` — `pkg` (resolve the name), `npm`, `uv`, `cargo`, or `official` (run an installer)
+* `method` — `pkg` (resolve the name), `npm`, `uv`, `cargo`, `official` (run an
+  installer), or `none` (not a package: listed so the inventory stays complete,
+  but a dedicated section installs it)
 * `package mapping` — `manager=package` pairs; `-` means "not on this manager"
 * `probe` — executables that count as "already installed", when it is not the id
   (Debian calls it `fdfind`, `btop`, `codium`)
+
+`kubectl`, `oc`, `kubectx`, `kubens` and `stern` use `method=none`. They are not
+packages anywhere: the `k8s` section downloads them, verifies their checksums
+and pins their versions. They are in the manifest anyway so that one file lists
+everything a machine ends up with, and so `--skip-tools` reaches them like any
+other tool. Selecting them with `--tools` or `--extras` does nothing on its own —
+keep the `k8s` section enabled.
 
 So a new workstation is a one-line diff, not a code change:
 
@@ -61,6 +70,9 @@ So a new workstation is a one-line diff, not a code change:
 
 # drop the ones you already have your own way
 ./my-shell.sh --extras=daily --skip-tools=bat,eza
+
+# --skip-tools also covers the binaries the k8s section downloads
+./my-shell.sh --extras=k8s --skip-tools=kubectx,stern
 ```
 
 A tool that cannot be installed on the current distribution is **reported and
@@ -137,7 +149,33 @@ around it looped forever. Those are gone. The rules now are:
 * **Downloads are checksum-verified** (`kubectl`, `kubectx`, `kubens`, `stern`).
   The OpenShift mirror publishes no checksum for `oc`; that is called out.
 * **`--dry-run` changes nothing.** It never writes, including inside existing
-  managed blocks.
+  managed blocks. It also predicts privilege escalation correctly: a directory
+  that does not exist yet but whose parent is writable is reported without
+  `sudo`, because that is what the real run would do.
+
+## Reporting and exit status
+
+The run always goes to the end. A download that cannot complete, a font archive
+that comes back truncated, a `chsh` that needs a password you are not there to
+type — none of these abandon the setup half-finished. They are reported, and the
+summary marks which sections were affected:
+
+```
+  fonts      done
+  k8s        finished with 1 problem(s)
+[ fail] 2 step(s) did not complete; the run finished anyway
+```
+
+**The exit status is non-zero if any step did not complete**, so a provisioning
+pipeline or a dotfile installer that runs this can tell the difference between
+"everything is configured" and "the script did not crash". A step that was not
+needed — a tool already present, a font family already installed — is a `[ skip]`
+and counts for nothing.
+
+Two categories are deliberately *not* fatal, because aborting would be worse than
+the problem: a font or a login-shell change that needs `sudo` prints the exact
+command to run yourself, and a download failure prints the URL. Both still count
+as problems in the exit status.
 
 ## Notes and deliberate choices
 
@@ -154,7 +192,14 @@ around it looped forever. Those are gone. The rules now are:
 * **Backups** go to `${XDG_STATE_HOME:-~/.local/state}/my-shell/backups/`
   (`--backup-dir` to change). `/etc/passwd` is backed up before `chsh`.
 * **Binaries** go to `/usr/local/bin` when it is writable, otherwise to
-  `~/.local/bin` so the script works without `sudo` at all.
+  `~/.local/bin` so the script works without `sudo` at all. Because that
+  directory may not be on your `PATH` yet, the script looks for its own previous
+  installs there too — otherwise the second run would not recognise them and
+  would download everything again.
+* **`oc` is not refreshed automatically.** The OpenShift mirror serves a single
+  rolling `latest` tarball with no version index and no checksum, so there is no
+  way to tell whether the installed client is current. It is left alone if
+  present, and the summary says how to force a refresh.
 * **`--aur` is opt-in.** AUR packages are built from a PKGBUILD, which is
   arbitrary code executed as root. No helper (`paru`, `yay`, `pikaur`, `trizen`)
   is ever used unless you ask for it.
