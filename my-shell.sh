@@ -48,7 +48,7 @@ fi
 set -Eeuo pipefail
 
 readonly SCRIPT_NAME="my-shell"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 
 # Resolve paths relative to the script, never to $PWD: the original version used
 # `./config_files/...` and silently failed when started from another directory.
@@ -73,6 +73,12 @@ VERBOSE=0
 NO_COLOR_FLAG=0
 UPGRADE_SYSTEM=0
 SET_DEFAULT_SHELL=0
+# Steps that failed without stopping the run: a download that would not
+# complete, a block that could not be written. The run always goes to the end,
+# but the exit status has to tell the caller that something did not happen.
+RUN_FAILURES=0
+# Problems per section, filled in by run_sections.
+declare -A SECTION_FAILURES=()
 REPLACE_P10K=0
 INSTALL_KUBE_PS1=0
 PROMPT_ENGINE="powerlevel10k"
@@ -144,7 +150,7 @@ setup_colors() {
 log_info() { printf '%s[ info]%s %s\n' "$C_BLU" "$C_OFF" "$*"; }
 log_ok()   { printf '%s[  ok ]%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
 log_warn() { printf '%s[ warn]%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
-log_err()  { printf '%s[ fail]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+log_err()  { printf '%s[ fail]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; RUN_FAILURES=$(( RUN_FAILURES + 1 )); }
 log_skip() { printf '%s[ skip]%s %s\n' "$C_DIM" "$C_OFF" "$*"; }
 log_dry()  { printf '%s[dry  ]%s %s\n' "$C_MAG" "$C_OFF" "$*"; }
 # log_done: "this has been done". During a dry run nothing was done, so the
@@ -257,6 +263,29 @@ try() {
     return 1
 }
 
+# try_privileged <command>...
+# Run something that needs root, where a failure is inconvenient but must not
+# kill the run: fonts and the default login shell are cosmetic compared to the
+# rest of the setup, and a missing sudo password (CI, containers, a machine
+# where the account has no sudo at all) would otherwise abort the script after
+# everything else already succeeded.
+#
+# Returns the command's own status, so callers can tell what really happened.
+# Always call it in a condition: that is what stops a non-zero status from
+# reaching `set -e` and the ERR trap, which would abort the whole run.
+try_privileged() {
+    if (( DRY_RUN )); then
+        log_dry "$(quote_cmd "$@")"
+        return 0
+    fi
+    if as_root "$@"; then
+        return 0
+    fi
+    log_warn "needs root, skipped: $(quote_cmd "$@")"
+    log_warn "      run it yourself with: sudo $(quote_cmd "$@")"
+    return 1
+}
+
 # as_root: run a command with root privileges (sudo / doas / already root).
 as_root() {
     if ((${#SUDO[@]} > 0)); then
@@ -297,7 +326,7 @@ install_binary() {  # install_binary <src> <dst-path>
     ensure_dir "$dir"
 
     # A user-writable destination must not be chown'ed to root.
-    if [[ -w $dir ]]; then
+    if dir_writable "$dir"; then
         run install -m 0755 -- "$src" "$dst"
         return 0
     fi
@@ -652,6 +681,20 @@ pkg_install() {  # pkg_install <pkg>...
     esac
 }
 
+# try_dl <command>...
+# Like try, but does not short-circuit on a dry run: the command is still run so
+# it can print what it would fetch. Use it for installers that log their own
+# preview, so a dry run shows the version and the URL instead of a function name.
+# Always returns 0, for the same reason try does: a download that cannot be
+# completed is a warning, not a reason to abandon the rest of the setup.
+try_dl() {
+    if "$@"; then
+        return 0
+    fi
+    log_warn "ignoring failure of: $(quote_cmd "$@")"
+    return 0
+}
+
 # =============================================================================
 #  Tool manifest (config_files/tools.conf)
 # =============================================================================
@@ -698,6 +741,13 @@ tool_present() {  # tool_present <id>
     local id="$1" probes c
     probes=$(tool_field "$id" probe) || probes=""
     if [[ -z $probes || $probes == "-" ]]; then
+        # The k8s section owns these five and may have put them in
+        # ~/.local/bin, which is not on PATH until the user adds it. Only they
+        # get that extra lookup: for any other tool a same-named file in the k8s
+        # bin dir would be a false positive.
+        case "$id" in
+            kubectl|oc|kubectx|kubens|stern) have_installed "$id"; return ;;
+        esac
         have "$id"
         return
     fi
@@ -876,22 +926,58 @@ backend_install() {  # backend_install <method> <arg>
     esac
 }
 
+# dir_writable <dir>
+# True when a file could be created inside <dir>. A directory that does not exist
+# yet counts as writable when its nearest existing ancestor is, which is what
+# ensure_dir is about to create. Testing `-w` on a missing directory is always
+# false, so a dry run would otherwise predict a root escalation that the real run
+# would never perform.
+dir_writable() {  # dir_writable <dir>
+    local d="$1"
+    while [[ ! -e $d ]]; do
+        local parent
+        parent=$(dirname -- "$d")
+        if [[ $parent == "$d" ]]; then
+            return 1
+        fi
+        d="$parent"
+    done
+    [[ -d $d && -w $d ]]
+}
+
 # =============================================================================
 #  Download / verify helpers
 # =============================================================================
 fetch_file() {  # fetch_file <url> <dest>
+    # The download is wrapped in a condition on purpose. Called bare, a
+    # transient network error would reach the ERR trap and abort a run that has
+    # otherwise succeeded, so the failure is reported here and the caller
+    # decides whether it matters.
     local url="$1" dest="$2"
     if (( DRY_RUN )); then
         log_dry "download $url -> $dest"
         return 0
     fi
+    local rc=0
     if have curl; then
-        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$dest" -- "$url"
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$dest" -- "$url" || rc=$?
     elif have wget; then
-        wget -q -T 20 -t 3 -O "$dest" -- "$url"
+        wget -q -T 20 -t 3 -O "$dest" -- "$url" || rc=$?
     else
         die "neither curl nor wget is available; cannot download $url"
     fi
+    if (( rc != 0 )); then
+        rm -f -- "$dest"
+        log_err "download failed (exit $rc): $url"
+        return 1
+    fi
+    # A server that closes the connection early can still exit 0 and leave a
+    # partial body behind. Callers unpack what they get, so catch it here.
+    if [[ ! -s $dest ]]; then
+        log_err "download produced an empty file: $url"
+        return 1
+    fi
+    return 0
 }
 
 fetch_stdout() {  # fetch_stdout <url>
@@ -918,7 +1004,9 @@ sha256_of() {  # sha256_of <file>
 }
 
 verify_sha256() {  # verify_sha256 <file> <sha-url> [name-as-listed-in-the-checksum-file]
-    local f="$1" sha_url="$2" want="${3:-}" body expected actual
+    # Every variable is initialised: `local expected` alone leaves it *unset*,
+    # and under `set -u` reading an unset variable aborts the run.
+    local f="$1" sha_url="$2" want="${3:-}" body="" expected="" actual=""
     body=$(fetch_stdout "$sha_url" 2>/dev/null) || body=""
 
     if [[ -n $want ]]; then
@@ -1466,7 +1554,10 @@ install_nerd_font() {  # install_nerd_font <asset-zip> <probe-regex> <label>
     zip="$TMPDIR_ME/$asset"
     stage="$TMPDIR_ME/fonts-$label"
 
-    fetch_file "https://github.com/ryanoasis/nerd-fonts/releases/download/${version}/${asset}" "$zip"
+    if ! fetch_file "https://github.com/ryanoasis/nerd-fonts/releases/download/${version}/${asset}" "$zip"; then
+        log_warn "$label: could not download $asset, skipping this font"
+        return 1
+    fi
     if (( DRY_RUN )); then
         log_dry "unzip $zip -> $FONT_INSTALL_DIR (flattened)"
         return 0
@@ -1480,18 +1571,32 @@ install_nerd_font() {  # install_nerd_font <asset-zip> <probe-regex> <label>
     local count
     count=$(find "$stage" -maxdepth 1 -name '*.ttf' | wc -l)
     if [[ $count -eq 0 ]]; then
-        die "$asset contained no .ttf files"
+        # A truncated or error-page download yields no font files. Only the
+        # prompt icons are affected, so this is a warning, never a reason to
+        # abandon the rest of the setup.
+        log_warn "$label: $asset yielded no .ttf files ($(( $(wc -c < "$zip") )) bytes downloaded)"
+        log_warn "      retry later, or install it by hand from"
+        log_warn "      https://github.com/ryanoasis/nerd-fonts/releases"
+        return 1
     fi
     log_ok "unpacked $count font files for $label"
 
     ensure_dir "$FONT_INSTALL_DIR"
+    local copied=0
     if cp -a -- "$stage/." "$FONT_INSTALL_DIR/" 2>/dev/null; then
-        :
+        copied=1
     else
-        run as_root cp -a -- "$stage/." "$FONT_INSTALL_DIR/"
+        # Not fatal: the glyphs only affect icon rendering in the prompt.
+        if try_privileged cp -a -- "$stage/." "$FONT_INSTALL_DIR/"; then
+            copied=1
+        fi
     fi
     rm -rf -- "$stage"
-    log_ok "$label installed into $FONT_INSTALL_DIR"
+    if (( copied )); then
+        log_done "$label installed into $FONT_INSTALL_DIR"
+    else
+        log_warn "$label unpacked but not copied into $FONT_INSTALL_DIR"
+    fi
 }
 
 section_fonts() {
@@ -1502,13 +1607,16 @@ section_fonts() {
         log_warn "fc-cache is missing; install fontconfig first (or keep the 'deps' section enabled)"
     fi
 
+    # try_dl rather than a bare call: install_nerd_font returns 1 when a
+    # download comes back unusable, and a bare non-zero status would abort the
+    # whole run over a font. It also logs its own dry-run preview.
     case "$FONT_SET" in
         none) log_skip "FONT_SET=none"; return 0 ;;
-        meslo) install_nerd_font "Meslo.zip" "MesloLGS.*Nerd" "MesloLGS NF" ;;
-        hack)  install_nerd_font "Hack.zip"  "HackNerdFont|Hack Nerd Font" "Hack Nerd Font" ;;
+        meslo) try_dl install_nerd_font "Meslo.zip" "MesloLGS.*Nerd" "MesloLGS NF" ;;
+        hack)  try_dl install_nerd_font "Hack.zip"  "HackNerdFont|Hack Nerd Font" "Hack Nerd Font" ;;
         both)
-            install_nerd_font "Meslo.zip" "MesloLGS.*Nerd" "MesloLGS NF"
-            install_nerd_font "Hack.zip"  "HackNerdFont|Hack Nerd Font" "Hack Nerd Font"
+            try_dl install_nerd_font "Meslo.zip" "MesloLGS.*Nerd" "MesloLGS NF"
+            try_dl install_nerd_font "Hack.zip"  "HackNerdFont|Hack Nerd Font" "Hack Nerd Font"
             ;;
         *) die "invalid --fonts value '$FONT_SET' (expected: meslo, hack, both, none)" ;;
     esac
@@ -1524,12 +1632,12 @@ section_fonts() {
     # fontconfig also indexes the system directories, so a user-owned target
     # still produces permission warnings for those; only escalate when we
     # actually had to write into a root-owned directory.
-    if [[ -w $FONT_INSTALL_DIR ]]; then
+    if dir_writable "$FONT_INSTALL_DIR"; then
         fc-cache -f >/dev/null 2>&1 || log_warn "fc-cache reported problems; run 'fc-cache -fv' to inspect"
     else
         as_root fc-cache -f >/dev/null || log_warn "fc-cache reported problems; run 'sudo fc-cache -fv' to inspect"
     fi
-    log_ok "font cache rebuilt"
+    log_done "font cache rebuilt"
 }
 
 # =============================================================================
@@ -1839,13 +1947,32 @@ warn_if_shadowed() {  # warn_if_shadowed <command> <target-path>
     fi
 }
 
+# tool_path <cmd> -> prints the full path, or nothing
+# The k8s binaries can live in ~/.local/bin, which is not on PATH until the
+# user adds it. Looking them up with `command -v` alone would therefore make the
+# script blind to its own previous run and reinstall the same binaries forever.
+tool_path() {
+    local found
+    if found=$(command -v "$1" 2>/dev/null) && [[ -x $found ]]; then
+        printf '%s' "$found"
+        return 0
+    fi
+    if [[ -n ${KUBECTL_BIN_DIR:-} && -x ${KUBECTL_BIN_DIR}/$1 ]]; then
+        printf '%s' "${KUBECTL_BIN_DIR}/$1"
+        return 0
+    fi
+    return 1
+}
+
+# have_installed <cmd>: like have, but also looks in the k8s install directory
+have_installed() { tool_path "$1" >/dev/null; }
+
 installed_binary_version() {  # installed_binary_version <cmd> <version-args> [grep-pattern]
-    local cmd="$1" vargs="$2" pattern="${3:-}"
-    have "$cmd" || return 1
-    local out
+    local cmd="$1" vargs="$2" pattern="${3:-}" path out
+    path=$(tool_path "$cmd") || return 1
     # vargs is deliberately unquoted: it is a small argument string.
     # shellcheck disable=SC2086
-    out=$("$cmd" $vargs 2>/dev/null) || return 1
+    out=$("$path" $vargs 2>/dev/null) || return 1
     out=$(printf '%s\n' "$out" | head -5)
     if [[ -n $pattern ]]; then
         printf '%s' "$out" | grep -oE -- "$pattern" | head -1
@@ -1860,7 +1987,7 @@ install_kubectl() {
         ver=$(fetch_stdout "https://dl.k8s.io/release/stable.txt" | tr -d '[:space:]' || true)
     fi
     if [[ -z $ver ]]; then
-        log_warn "cannot determine the latest kubectl version, skipping"
+        log_err "cannot determine the latest kubectl version, skipping"
         return 0
     fi
 
@@ -1870,7 +1997,7 @@ install_kubectl() {
     fi
     [[ -n $current ]] || current=$(installed_binary_version kubectl "version --client" 'v?[0-9]+\.[0-9]+\.[0-9]+[-+a-z0-9.]*' || true)
     if [[ $current == "$ver" ]]; then
-        log_skip "kubectl $ver already installed ($(command -v kubectl))"
+        log_skip "kubectl $ver already installed ($(tool_path kubectl))"
         return 0
     fi
     if [[ -n $current ]]; then
@@ -1903,10 +2030,20 @@ install_oc() {
         return 0
     fi
 
-    local current=""
-    if current=$(installed_binary_version oc "version --client" 'v?[0-9]+\.[0-9]+\.[0-9]+[-+a-z0-9.]*'); then
-        log_info "oc $current present; refreshing from the OpenShift mirror"
-    else
+    # The OpenShift mirror publishes one rolling "latest" tarball, with no
+    # version index and no checksum. There is no way to tell whether the
+    # installed oc is still the current one, and re-downloading ~100MB on every
+    # run would make this section never converge. Skip when present and say how
+    # to force a refresh.
+    local current="" existing=""
+    existing=$(tool_path oc || printf '')
+    if [[ -n $existing ]] && current=$(installed_binary_version oc "version --client" 'v?[0-9]+\.[0-9]+\.[0-9]+[-+a-z0-9.]*'); then
+        log_skip "oc $current already present ($existing)"
+        log_info "      the mirror has no version index, so it is not refreshed"
+        log_info "      automatically; to update it: rm -f '$existing' and re-run"
+        return 0
+    fi
+    if [[ -z $existing ]]; then
         log_info "oc not installed; downloading the latest release"
     fi
 
@@ -1955,7 +2092,7 @@ install_kubectx() {
         ver=$(github_latest_tag ahmetb/kubectx || true)
     fi
     if [[ -z $ver ]]; then
-        log_warn "cannot determine the latest kubectx release, skipping"
+        log_err "cannot determine the latest kubectx release, skipping"
         return 1
     fi
     if ! arch=$(kubectx_release_arch); then
@@ -1963,8 +2100,8 @@ install_kubectx() {
         return 1
     fi
 
-    if have kubectx && have kubens; then
-        log_skip "kubectx/kubens already installed ($(command -v kubectx))"
+    if have_installed kubectx && have_installed kubens; then
+        log_skip "kubectx/kubens already installed ($(tool_path kubectx))"
         return 0
     fi
 
@@ -2001,11 +2138,11 @@ install_stern() {
         ver=$(github_latest_tag stern/stern || true)
     fi
     if [[ -z $ver ]]; then
-        log_warn "cannot determine the latest stern release, skipping"
+        log_err "cannot determine the latest stern release, skipping"
         return 0
     fi
-    if have stern; then
-        log_skip "stern already installed ($(command -v stern))"
+    if have_installed stern; then
+        log_skip "stern already installed ($(tool_path stern))"
         return 0
     fi
     require_tmpdir
@@ -2133,10 +2270,32 @@ section_k8s() {
     log_info "installing binaries into $KUBECTL_BIN_DIR"
 
     if have git; then
-        try install_kubectl
-        try install_oc
-        try install_kubectx
-        try install_stern
+        # Called directly rather than through try: try short-circuits on a dry
+        # run and would only print the function name, hiding the version, the
+        # download URL and the checksum. These functions log a preview of
+        # themselves instead, and a failure to download is not fatal.
+        # --skip-tools reaches them too, so the one selection mechanism covers
+        # manifest tools and the binaries this section downloads.
+        if tool_skipped kubectl; then
+            log_skip "kubectl (excluded by --skip-tools)"
+        else
+            try_dl install_kubectl
+        fi
+        if tool_skipped oc; then
+            log_skip "oc (excluded by --skip-tools)"
+        else
+            try_dl install_oc
+        fi
+        if tool_skipped kubectx || tool_skipped kubens; then
+            log_skip "kubectx, kubens (excluded by --skip-tools)"
+        else
+            try_dl install_kubectx
+        fi
+        if tool_skipped stern; then
+            log_skip "stern (excluded by --skip-tools)"
+        else
+            try_dl install_stern
+        fi
     else
         log_warn "git is required to download the release archives, skipping"
     fi
@@ -2270,11 +2429,29 @@ install_manifest_tool() {  # install_manifest_tool <id>
             fi
             log_done "$id"
             ;;
+        none)
+            # Listed in the manifest so the inventory is complete and
+            # --skip-tools reaches it, but it is not a package: a dedicated
+            # section downloads it and verifies its checksum.
+            log_skip "$id: not a package, provided by its own section"
+            return 0
+            ;;
         *)
             log_warn "$id: unsupported manifest method '$method'"
             return 1
             ;;
     esac
+}
+
+# tool_skipped <id> -> true when --skip-tools named this tool
+tool_skipped() {
+    local s
+    for s in "${SKIP_TOOLS[@]}"; do
+        if [[ $s == "$1" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 section_extras() {
@@ -2384,11 +2561,19 @@ section_extras() {
         mapfile -t uniq < <(printf '%s\n' "${uniq[@]}" | sort)
     fi
 
-    local installed=0 failed=0 id
+    local installed=0 failed=0 deferred=0 id method
     for id in "${uniq[@]}"; do
         # Called directly rather than through try: try short-circuits on dry-run,
         # and a dry run is exactly when you want to see how each tool resolves.
         # install_manifest_tool already logs its own warnings.
+        if tool_field "$id" method >/dev/null 2>&1 && [[ $(tool_field "$id" method) == "none" ]]; then
+            # Listed for completeness only. Counting it as installed would make
+            # the totals claim something this section did not do.
+            if install_manifest_tool "$id"; then
+                deferred=$(( deferred + 1 ))
+            fi
+            continue
+        fi
         if install_manifest_tool "$id"; then
             installed=$(( installed + 1 ))
         else
@@ -2421,10 +2606,14 @@ section_extras() {
         fi
     fi
 
+    local deferred_note=""
+    if (( deferred > 0 )); then
+        deferred_note=", $deferred handled by another section"
+    fi
     if (( DRY_RUN )); then
-        log_info "tools: $installed would be installed, $failed unavailable here"
+        log_info "tools: $installed would be installed, $failed unavailable here${deferred_note}"
     else
-        log_info "tools: $installed ready, $failed unavailable on this system"
+        log_info "tools: $installed ready, $failed unavailable on this system${deferred_note}"
     fi
     if (( failed > 0 )); then
         log_info "  the manifest records why; edit $TOOL_MANIFEST to adjust"
@@ -2464,15 +2653,25 @@ section_shell() {
     fi
 
     if [[ $GOOS == "darwin" ]]; then
-        run dscl . -change "/Users/${USER}" UserShell "$target"
+        # dscl does not need root, but it fails on a machine where the user
+        # record is managed by something else. That is not worth aborting for.
+        if run dscl . -change "/Users/${USER}" UserShell "$target"; then
+            log_done "default shell set to $target (log out and back in to see it)"
+        else
+            log_warn "dscl could not change the shell; run it by hand:"
+            log_warn "      sudo dscl . -change \"/Users/${USER}\" UserShell $target"
+        fi
         return 0
     fi
 
     if [[ -f /etc/passwd ]]; then
         backup_file /etc/passwd
     fi
-    run as_root chsh -s "$target" "${USER:-$(id -un)}"
-    log_done "default shell set to $target (log out and back in to see it)"
+    if try_privileged chsh -s "$target" "${USER:-$(id -un)}"; then
+        log_done "default shell set to $target (log out and back in to see it)"
+    else
+        log_info "everything else is done; the login shell is the only step left"
+    fi
 }
 
 # =============================================================================
@@ -2604,10 +2803,17 @@ validate_sections() {
 }
 
 run_sections() {
-    local s
+    local s before after
     for s in "${ALL_SECTIONS[@]}"; do
         if (( SECTION_ON[$s] )); then
+            # Snapshot the failure counter around each section so the summary
+            # can say which ones actually completed. A section that could not
+            # install something still runs to the end, so "done" on its own
+            # would be a claim the log does not support.
+            before=$RUN_FAILURES
             "section_${s}"
+            after=$RUN_FAILURES
+            SECTION_FAILURES[$s]=$(( after - before ))
         else
             log_step "Section: ${s}"
             log_skip "disabled"
@@ -2621,13 +2827,23 @@ summary() {
     local s
     for s in "${ALL_SECTIONS[@]}"; do
         if (( SECTION_ON[$s] )); then
-            printf '  %s%-10s%s done\n' "$C_GRN" "$s" "$C_OFF"
+            if (( ${SECTION_FAILURES[$s]:-0} > 0 )); then
+                printf '  %s%-10s%s finished with %d problem(s)\n' \
+                    "$C_YEL" "$s" "$C_OFF" "${SECTION_FAILURES[$s]}"
+            else
+                printf '  %s%-10s%s done\n' "$C_GRN" "$s" "$C_OFF"
+            fi
         fi
     done
 
     if (( DRY_RUN )); then
         log_info "dry run: no changes were made"
         return 0
+    fi
+
+    if (( RUN_FAILURES > 0 )); then
+        log_err "$RUN_FAILURES step(s) did not complete; the run finished anyway"
+        log_err "the [ fail] lines above say which ones"
     fi
 
     local -a next=()
@@ -2866,6 +3082,14 @@ main() {
 
     run_sections
     summary
+
+    # The setup always runs to the end, so a zero status cannot be inferred
+    # from "it did not crash". A caller in a provisioning pipeline needs to know
+    # whether everything it asked for actually happened.
+    if (( RUN_FAILURES > 0 )); then
+        return 1
+    fi
+    return 0
 }
 
 main "$@"
