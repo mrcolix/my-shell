@@ -48,7 +48,7 @@ fi
 set -Eeuo pipefail
 
 readonly SCRIPT_NAME="my-shell"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 
 # Resolve paths relative to the script, never to $PWD: the original version used
 # `./config_files/...` and silently failed when started from another directory.
@@ -282,7 +282,11 @@ try_privileged() {
         return 0
     fi
     log_warn "needs root, skipped: $(quote_cmd "$@")"
-    log_warn "      run it yourself with: sudo $(quote_cmd "$@")"
+    if ((${#SUDO[@]} > 0)); then
+        log_warn "      run it yourself with: sudo $(quote_cmd "$@")"
+    else
+        log_warn "      you are already root, so run it yourself: $(quote_cmd "$@")"
+    fi
     return 1
 }
 
@@ -980,13 +984,22 @@ fetch_file() {  # fetch_file <url> <dest>
     return 0
 }
 
-fetch_stdout() {  # fetch_stdout <url>
+fetch_stdout() {  # fetch_stdout <url> [any-status]
+    # any-status: keep the body even on a 4xx/5xx. Callers that need to read an
+    # error message from GitHub have to ask for it, because curl's own -f throws
+    # the body away and it is the only place that says why a request was
+    # refused.
+    local url="$1" any="${2:-}"
     if have curl; then
-        curl -fsSL --retry 3 --connect-timeout 20 -- "$1"
+        if [[ -n $any ]]; then
+            curl -sSL --retry 3 --connect-timeout 20 -- "$url"
+        else
+            curl -fsSL --retry 3 --connect-timeout 20 -- "$url"
+        fi
     elif have wget; then
-        wget -q -O- -- "$1"
+        wget -q -O- -- "$url"
     else
-        die "neither curl nor wget is available; cannot download $1"
+        die "neither curl nor wget is available; cannot download $url"
     fi
 }
 
@@ -1055,14 +1068,41 @@ download_verified() {
     return 0
 }
 
-github_latest_tag() {  # github_latest_tag <owner/repo>
-    # Read the whole body first: piping curl straight into grep/head makes curl
-    # die with "Failure writing output to destination" (exit 23) every time.
-    local body
-    body=$(fetch_stdout "https://api.github.com/repos/$1/releases/latest" 2>/dev/null) || return 1
-    printf '%s' "$body" \
+# One answer per repository per run. The unauthenticated GitHub API allows 60
+# requests an hour per IP, and NAT means every machine behind the same router
+# shares that budget: asking twice for the same repository is how a run runs out
+# halfway through.
+declare -A GH_TAG_CACHE=()
+
+github_latest_tag() {  # github_latest_tag <owner/repo> [pin-option]
+    local repo="$1" pin="${2:-}" body tag
+    if [[ -n ${GH_TAG_CACHE[$repo]:-} ]]; then
+        printf '%s' "${GH_TAG_CACHE[$repo]}"
+        return 0
+    fi
+    # any-status: a 403 comes back with an empty body under curl's -f, and the
+    # body is exactly what distinguishes "rate limited" from "no such repo".
+    body=$(fetch_stdout "https://api.github.com/repos/$repo/releases/latest" any 2>/dev/null) || body=""
+    if [[ -z $body ]]; then
+        return 1
+    fi
+    # Herestring, not a pipe: `printf ... | grep -q` would hand grep an early
+    # exit and leave printf killed by SIGPIPE, which `pipefail` turns into a
+    # false "not rate limited".
+    if grep -m1 -qi 'rate limit' <<< "$body"; then
+        log_warn "GitHub API rate limit reached for $repo (60/hour, unauthenticated)"
+        log_warn "      every machine behind this IP shares the same budget"
+        if [[ -n $pin ]]; then
+            log_warn "      to skip the lookup, pin the version: $pin"
+        fi
+        return 1
+    fi
+    tag=$(printf '%s' "$body" \
         | grep -m1 -oE '"tag_name":[[:space:]]*"[^"]+"' \
-        | sed -E 's/.*"([^"]+)"$/\1/'
+        | sed -E 's/.*"([^"]+)"$/\1/')
+    [[ -n $tag ]] || return 1
+    GH_TAG_CACHE[$repo]="$tag"
+    printf '%s' "$tag"
 }
 
 ensure_git_repo() {  # ensure_git_repo <url> <dest> [branch]
@@ -1414,20 +1454,103 @@ plugin_entry_file() {  # plugin_entry_file <dir> <name>
 # -----------------------------------------------------------------------------
 declare -A BLOCK_PARTS=()
 
-# block_add <shell> <comment>   (body read from stdin)
+# block_add <shell> <id> <comment>   (body read from stdin)
+#
+# The id is what makes the managed block repairable. Every contribution is
+# tagged, so a later run can tell "this section regenerated its part" from "this
+# part came from a section that did not run this time" and keep the second. That
+# matters because a block written by an older version of this script can contain
+# something that is no longer valid; without the ids the script would have no way
+# to fix it, and would leave the user with a broken .zshrc forever.
 block_add() {
-    local shell_name="$1" comment="$2" body
+    local shell_name="$1" id="$2" comment="$3" body
     body=$(cat)
     if [[ -z ${BLOCK_PARTS[$shell_name]+x} ]]; then
         BLOCK_PARTS[$shell_name]=""
     fi
-    # The comment is emitted as a real comment: '#' works in zsh, bash and fish.
-    BLOCK_PARTS[$shell_name]+="# ${comment}"$'\n'"${body}"$'\n'
+    # The header is emitted as a real comment: '#' works in zsh, bash and fish.
+    BLOCK_PARTS[$shell_name]+="# [${SCRIPT_NAME}:${id}] ${comment}"$'\n'"${body}"$'\n'
+}
+
+# merge_block <rc> <shell> <new-content-file>  -> merged content on stdout
+# New contributions win over the ones already in the file; contributions whose
+# section did not run this time are carried over untouched. Returns 1 when the
+# existing block predates the markers, because then it cannot be merged without
+# guessing which section wrote which part.
+merge_block() {
+    local rc="$1" sh="$2" newf="$3" existing marker
+    existing="$TMPDIR_ME/block_existing.$sh"
+
+    marker="# [${SCRIPT_NAME}:"
+    : > "$existing"
+    if [[ -f $rc ]]; then
+        awk -v b="$MB_BEGIN" -v e="$MB_END" '
+            $0 == b { inblk = 1; next }
+            $0 == e { inblk = 0; next }
+            inblk { print }
+        ' "$rc" > "$existing"
+    fi
+
+    if [[ -s $existing ]] && ! grep -qF -- "$marker" "$existing"; then
+        return 1
+    fi
+
+    # The marker contains '[' and ']', so the id is cut out with substr/index
+    # rather than a regular expression that would read them as metacharacters.
+    awk -v marker="$marker" '
+        function collect(file, arr, hdr, ord,   line, id, body, cur, head, p, k) {
+            k = 0; cur = ""; body = ""; head = ""
+            while ((getline line < file) > 0) {
+                if (index(line, marker) == 1) {
+                    if (cur != "") { k++; arr[k] = body; hdr[k] = head; ord[k] = cur }
+                    head = line
+                    id = substr(line, length(marker) + 1)
+                    p = index(id, "]")
+                    if (p > 0) id = substr(id, 1, p - 1)
+                    cur = id; body = ""
+                } else if (cur != "") {
+                    body = body (body == "" ? "" : "\n") line
+                }
+            }
+            close(file)
+            if (cur != "") { k++; arr[k] = body; hdr[k] = head; ord[k] = cur }
+            return k
+        }
+        function emit(hdr, body) {
+            if (hdr != "") print hdr
+            if (body != "") print body
+        }
+        BEGIN {
+            # ARGV, not stdin: with no file operands awk would read the stdin of
+            # the calling shell and print nothing. The operands are here so awk
+            # never looks at stdin; the only reads are the getline in collect.
+            n = collect(ARGV[1], nb, nh, no)
+            m = collect(ARGV[2], ob, oh, oo)
+
+            for (i = 1; i <= n; i++) { nid[no[i]] = 1; nbody[no[i]] = nb[i]; nhdr[no[i]] = nh[i] }
+            for (i = 1; i <= m; i++) { ohdr[oo[i]] = oh[i]; obody[oo[i]] = ob[i] }
+
+            # The order of the block already in the file wins, so re-running one
+            # section rewrites that chunk in place rather than moving it to the
+            # top: a config the user reads and diffs should not reshuffle itself
+            # every time a single section is re-run.
+            for (i = 1; i <= m; i++) {
+                id = oo[i]
+                if (nid[id]) emit(nhdr[id], nbody[id]); else emit(ohdr[id], obody[id])
+                done[id] = 1
+            }
+            # Chunks this run introduced, in the order it produced them.
+            for (i = 1; i <= n; i++) {
+                id = no[i]
+                if (!(id in done)) emit(nhdr[id], nbody[id])
+            }
+        }
+    ' "$newf" "$existing" 2>/dev/null
 }
 
 # flush_one_block <shell>
 flush_one_block() {
-    local sh="$1" rc content
+    local sh="$1" rc content merged merged_file
 
     if [[ -z ${BLOCK_PARTS[$sh]+x} || ${BLOCK_PARTS[$sh]} =~ ^[[:space:]]*$ ]]; then
         return 0
@@ -1458,7 +1581,25 @@ flush_one_block() {
         log_dry "write the managed block for $sh into $rc"
         return 0
     fi
-    write_managed_block "$rc" "$content" "added by $SCRIPT_NAME $SCRIPT_VERSION - safe to delete"
+
+    # Fold in what other sections wrote earlier, and replace this run's parts.
+    if ! merged=$(merge_block "$rc" "$sh" "$content"); then
+        # A block from before the per-section markers: there is no way to tell
+        # which section wrote which part, and guessing would mean dropping
+        # configuration the sections that did not run are responsible for. Show
+        # the new content and let the user make the one edit that fixes it.
+        log_warn "$rc has a managed block from an older version; leaving it alone"
+        log_warn "      delete the block between the two marker lines, then re-run:"
+        log_warn "      sed -i '/${MB_BEGIN}/,/${MB_END}/d' '$rc'"
+        log_warn "      what would have been written:"
+        printf '%s' "${BLOCK_PARTS[$sh]}" | sed 's/^/      | /'
+        return 0
+    fi
+    merged_file="$TMPDIR_ME/shell_block.merged.$sh"
+    # %s\n, not %s: command substitution strips the trailing newline, and
+    # without it the last line of the block runs into the closing marker.
+    printf '%s\n' "$merged" > "$merged_file"
+    write_managed_block "$rc" "$merged_file" "added by $SCRIPT_NAME $SCRIPT_VERSION - safe to delete"
 }
 
 flush_blocks() {
@@ -1480,7 +1621,26 @@ section_deps() {
     CURRENT_STEP="deps"
     log_step "Base dependencies"
 
-    local -a pkgs=(git curl wget unzip tar gzip)
+    # The manifest is the single source of truth for what a new machine needs, so
+    # the deps group and this section cannot drift apart. The fallback list is only
+    # for a run without the manifest; keeping it means a missing data file does not
+    # turn into a machine with no git.
+    local -a pkgs=() ids=() id pkg
+    if [[ -f $TOOL_MANIFEST ]]; then
+        mapfile -t ids < <(tool_in_group deps)
+        for id in "${ids[@]}"; do
+            if pkg=$(tool_package_for_manager "$id"); then
+                pkgs+=("$pkg")
+            else
+                log_warn "$id: no package for $PKG_MANAGER on ${OS_ID:-this system}"
+            fi
+        done
+    else
+        pkgs+=(git curl wget unzip tar gzip)
+    fi
+
+    # Not manifest tools: whether these are needed depends on what this run is
+    # going to do, not on the machine.
     if [[ $FONT_SET != "none" ]]; then
         pkgs+=(fontconfig)
     fi
@@ -1539,7 +1699,7 @@ install_nerd_font() {  # install_nerd_font <asset-zip> <probe-regex> <label>
 
     version="${NERD_FONT_VERSION}"
     if [[ -z $version ]]; then
-        version=$(github_latest_tag ryanoasis/nerd-fonts || true)
+        version=$(github_latest_tag ryanoasis/nerd-fonts "--font-version=V" || true)
     fi
     if [[ -z $version ]]; then
         version="v3.5.1"
@@ -1786,7 +1946,7 @@ section_plugins() {
     done
 
     if (( body_added )); then
-        block_add zsh "zsh plugins (loaded in the order zsh-syntax-highlighting requires)" <<< "$body"
+        block_add zsh "plugins" "zsh plugins (loaded in the order zsh-syntax-highlighting requires)" <<< "$body"
         log_done "plugin sourcing added to the managed block"
     fi
 
@@ -1868,20 +2028,53 @@ theme_powerlevel10k() {
     if zsh_rc_has_p10k; then
         log_skip "$ZSH_RC already loads Powerlevel10k"
         if ! zshrc_mentions 'p10k\.zsh'; then
-            block_add zsh "Powerlevel10k configuration" <<EOF
+            block_add zsh "p10k-config" "Powerlevel10k configuration" <<EOF
 [[ -r \$HOME/.p10k.zsh ]] && source "\$HOME/.p10k.zsh"
 EOF
         fi
         return 0
     fi
 
-    block_add zsh "Powerlevel10k theme" <<EOF
+    block_add zsh "p10k-theme" "Powerlevel10k theme" <<EOF
 if [[ -r '${theme_file}' ]]; then
   source '${theme_file}'
 fi
 [[ -r \$HOME/.p10k.zsh ]] && source "\$HOME/.p10k.zsh"
 EOF
     log_done "Powerlevel10k added to the managed block"
+}
+
+# The p10k configuration in this repo shows the git status, which comes from
+# vcs_info. When that is not available the prompt still comes up, and it fails on
+# every single redraw with a message most people read as part of the theme.
+# Checking it here turns that into one line, once.
+check_p10k_modules() {
+    [[ -f ${HOME}/.p10k.zsh ]] || return 0
+    grep -q 'vcs_info' "${HOME}/.p10k.zsh" 2>/dev/null || return 0
+
+    if (( DRY_RUN )); then
+        return 0
+    fi
+
+    # Look for the function file, not `zmodload zsh/vcs_info`: on Alpine vcs_info
+    # is autoloaded from /usr/share/zsh/*/functions and is not a loadable module
+    # at all, so a zmodload probe would report a broken prompt on a system where
+    # the prompt works. This is the same lookup that fails in the p10k error
+    # "vcs_info: function definition file not found".
+    # shellcheck disable=SC2016  # zsh expands $d, not this shell
+    if "$TARGET_SHELL" -fc '
+        fpath=(/usr/share/zsh/*/functions(N/*/) $fpath)
+        for d in $fpath; do
+            [[ -r $d/VCS_Info/vcs_info ]] && exit 0
+            [[ -r $d/vcs_info ]] && exit 0
+        done
+        exit 1
+    ' >/dev/null 2>&1; then
+        return 0
+    fi
+    log_warn "the prompt needs vcs_info and it is not installed"
+    log_warn "      the git segment will print an error on every redraw"
+    log_warn "      on Alpine: apk add zsh-vcs; elsewhere it is part of zsh"
 }
 
 theme_starship() {
@@ -1894,7 +2087,7 @@ theme_starship() {
         log_skip "$ZSH_RC already initialises starship"
         return 0
     fi
-    block_add zsh "starship prompt" <<'EOF'
+    block_add zsh "starship" "starship prompt" <<'EOF'
 if command -v starship >/dev/null 2>&1; then
   eval "$(starship init zsh)"
 fi
@@ -1908,7 +2101,13 @@ section_theme() {
 
     case "$PROMPT_ENGINE" in
         none) log_skip "PROMPT_ENGINE=none"; return 0 ;;
-        powerlevel10k) theme_powerlevel10k ;;
+        powerlevel10k)
+            theme_powerlevel10k
+            # Checked here, not inside theme_powerlevel10k: that function returns
+            # early when the rc already loads Powerlevel10k, which is the common
+            # case on a re-run, and the module is missing either way.
+            check_p10k_modules
+            ;;
         starship) theme_starship ;;
         *) die "invalid --prompt value '$PROMPT_ENGINE' (expected: powerlevel10k, starship, none)" ;;
     esac
@@ -2089,7 +2288,7 @@ install_kubectx() {
     local ver arch base
     ver="$KUBECTX_VERSION"
     if [[ -z $ver ]]; then
-        ver=$(github_latest_tag ahmetb/kubectx || true)
+        ver=$(github_latest_tag ahmetb/kubectx "--kubectx-version=V" || true)
     fi
     if [[ -z $ver ]]; then
         log_err "cannot determine the latest kubectx release, skipping"
@@ -2135,7 +2334,7 @@ install_stern() {
     local ver
     ver="$STERN_VERSION"
     if [[ -z $ver ]]; then
-        ver=$(github_latest_tag stern/stern || true)
+        ver=$(github_latest_tag stern/stern "--stern-version=V" || true)
     fi
     if [[ -z $ver ]]; then
         log_err "cannot determine the latest stern release, skipping"
@@ -2220,12 +2419,15 @@ EOF
 history_for() {  # history_for <shell>
     case "$1" in
         zsh)
+            # No `setopt COMPLETION_WAITING_DOTS` here: that option only exists
+            # in zsh 6.0 and later, and on zsh 5.9 it aborts the rest of the rc
+            # with "no such option". Oh My Zsh implements the same feature from
+            # the COMPLETION_WAITING_DOTS variable, which the template sets.
             cat <<'EOF'
 HISTFILE="${ZDOTDIR:-$HOME}/.zsh_history"
 HISTSIZE=100000
 SAVEHIST=100000
 setopt HIST_IGNORE_DUPS HIST_IGNORE_ALL_DUPS HIST_REDUCE_BLANKS HIST_SAVE_NO_DUPS
-setopt COMPLETION_WAITING_DOTS
 EOF
             ;;
         bash)
@@ -2250,16 +2452,16 @@ shell_rc_path() {  # shell_rc_path <shell>
     esac
 }
 
-# add_shell_block <comment> <content-on-stdin> [shell]
+# add_shell_block <id> <comment> <content-on-stdin> [shell]
 # Defaults to the resolved target shell. The snippet is accumulated, never
 # written directly, so several sections can contribute to the same block.
 add_shell_block() {
-    local comment="$1" body sh="${3:-$TARGET_SHELL}"
+    local id="$1" comment="$2" body sh="${3:-$TARGET_SHELL}"
     body=$(cat)
     if [[ -z $body || -z $sh ]]; then
         return 0
     fi
-    block_add "$sh" "$comment" <<< "$body"
+    block_add "$sh" "$id" "$comment" <<< "$body"
 }
 
 section_k8s() {
@@ -2314,15 +2516,14 @@ section_k8s() {
         if [[ -n $rc ]] && file_mentions_outside_block "$rc" 'kubectl completion'; then
             log_skip "completions already configured in $rc"
         else
-            add_shell_block "shell completion for the kubernetes tooling" <<< "$comp"
+            add_shell_block "k8s-completions" "shell completion for the kubernetes tooling" <<< "$comp"
             log_done "completions wired into $TARGET_SHELL"
         fi
     else
         log_skip "no completion generators available yet"
     fi
 
-    add_shell_block "kubernetes aliases" <<< "$(aliases_for "$TARGET_SHELL")"
-    add_shell_block "shell history tuning" <<< "$(history_for "$TARGET_SHELL")"
+    add_shell_block "k8s-aliases" "kubernetes aliases" <<< "$(aliases_for "$TARGET_SHELL")"
 }
 
 # =============================================================================
@@ -2635,6 +2836,12 @@ section_shell() {
     CURRENT_STEP="shell"
     log_step "Default login shell"
 
+    # History tuning has nothing to do with the login shell, but it used to live
+    # in the k8s section, so --skip=k8s silently dropped it. Contributed first,
+    # before any early return below, so it lands even when the login shell is
+    # already correct or chsh is unavailable.
+    add_shell_block "history" "shell history tuning" <<< "$(history_for "$TARGET_SHELL")"
+
     local target current
     target=$(command -v "$TARGET_SHELL" 2>/dev/null || printf '')
     if [[ -z $target ]]; then
@@ -2661,6 +2868,17 @@ section_shell() {
             log_warn "dscl could not change the shell; run it by hand:"
             log_warn "      sudo dscl . -change \"/Users/${USER}\" UserShell $target"
         fi
+        return 0
+    fi
+
+    if ! have chsh; then
+        # chsh is not part of a minimal install: Alpine keeps it in the shadow
+        # package, Debian in util-linux, RHEL in shadow-utils. Suggesting "sudo
+        # chsh" when the command does not exist sends the user down a dead end.
+        log_warn "chsh is not installed, so the default login shell is unchanged"
+        log_warn "      it comes from 'shadow' (apk add shadow), 'util-linux'"
+        log_warn "      (Debian/Ubuntu) or 'shadow-utils' (RHEL/Fedora)"
+        log_warn "      or edit the last field of your /etc/passwd line by hand"
         return 0
     fi
 
