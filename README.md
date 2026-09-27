@@ -62,6 +62,23 @@ everything a machine ends up with, and so `--skip-tools` reaches them like any
 other tool. Selecting them with `--tools` or `--extras` does nothing on its own —
 keep the `k8s` section enabled.
 
+The manifest is checked at the start of every run: a line with the wrong number
+of fields, a repeated id, or a `probe` that is a sentence instead of a list of
+executable names is reported and skipped. That last one matters more than it
+looks — a `probe` is handed to the lookup as a command name, so a bad value makes
+the script report a tool as installed when it is not.
+
+A mapping that names a package the archive does not have is not treated as an
+error. The script installs what it can, says which archive it looked in, and
+carries on:
+
+```
+[ warn] helm: 'helm' is not in the debian 12 archive; take it from its own release page
+```
+
+Marking it `-` instead would be wrong: the next Debian release packages several
+of them, and `-` would keep refusing. Trying is what self-corrects.
+
 So a new workstation is a one-line diff, not a code change:
 
 ```bash
@@ -224,7 +241,14 @@ The two that come up most often are called out by name:
   that into `zsh`; Alpine ships it as a separate `zsh-vcs` package. Without it the
   prompt still appears and prints `vcs_info: function definition file not found`
   on every redraw, which most people read as part of the theme. The `theme`
-  section checks for it and says so once.
+  section checks for it and says so once. The check looks for the function file
+  rather than running `zmodload zsh/vcs_info`, because on Alpine it is autoloaded
+  and is not a loadable module at all.
+* **`ca-certificates` is a base requirement**, not a nicety. Every download here
+  is over HTTPS, and `debian:bookworm-slim` ships without a trust store — the
+  symptom is `server certificate verification failed` from git and curl exit 77
+  from the font archives, which reads like a network problem. It is in the
+  manifest's `deps` group, and curl exit 77 is reported as what it is.
 * **Backups** go to `${XDG_STATE_HOME:-~/.local/state}/my-shell/backups/`
   (`--backup-dir` to change). `/etc/passwd` is backed up before `chsh`.
 * **Binaries** go to `/usr/local/bin` when it is writable, otherwise to
