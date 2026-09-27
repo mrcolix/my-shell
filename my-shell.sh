@@ -64,6 +64,19 @@ readonly CONFIG_DIR="$REPO_ROOT/config_files"
 readonly MB_BEGIN="# >>> ${SCRIPT_NAME} managed block >>>"
 readonly MB_END="# <<< ${SCRIPT_NAME} managed block <<<"
 
+# The package that provides the HTTPS trust store, per package manager. Kept out
+# of the manifest on purpose: the manifest is the tool inventory, this is the
+# advice printed when a download cannot be verified, and it has to be available
+# even on a run where the manifest is missing.
+declare -A CA_PACKAGES=(
+    [pacman]="ca-certificates (pacman)"
+    [apt]="ca-certificates (apt)"
+    [dnf]="ca-certificates (dnf)"
+    [zypper]="ca-certificates-mozilla (zypper)"
+    [apk]="ca-certificates (apk add ca-certificates)"
+    [brew]="ca-certificates (brew)"
+)
+
 # -----------------------------------------------------------------------------
 # Runtime state
 # -----------------------------------------------------------------------------
@@ -735,6 +748,39 @@ tool_field() {
     esac
 }
 
+# Check the manifest's own shape once per run, and say what is wrong with it.
+# A malformed field does not fail loudly on its own: a probe that is a sentence
+# instead of an executable name makes tool_present ask `have "not packaged on
+# Alpine 3.20"`, and the tool is then reported as installed when it is not.
+# Quietly wrong data is worse than a message the author has to read.
+validate_manifest() {
+    [[ -f $TOOL_MANIFEST ]] || return 0
+    local -A seen_id=()
+    local line id nf probe
+    while IFS= read -r line; do
+        nf=${line//[^|]/}
+        nf=$(( ${#nf} + 1 ))
+        id=${line%%|*}
+        if (( nf != 7 )); then
+            log_warn "$TOOL_MANIFEST: '$id' has $nf fields, expected 7; skipped"
+            continue
+        fi
+        if [[ -n ${seen_id[$id]:-} ]]; then
+            log_warn "$TOOL_MANIFEST: '$id' is listed more than once; the first wins"
+        fi
+        seen_id[$id]=1
+        # The whole field is tested before any word splitting: splitting on IFS
+        # first would turn the sentence "not packaged on Alpine 3.20" into four
+        # words that each look like a valid executable name, and the very
+        # mistake this check exists to catch would pass.
+        probe=$(cut -d'|' -f7 <<< "$line")
+        if [[ $probe != "-" && ! $probe =~ ^[A-Za-z0-9._+,-]+$ ]]; then
+            log_warn "$TOOL_MANIFEST: probe for '$id' is [$probe], not a list of executable names"
+            log_warn "      remediation belongs in the note column (field 6)"
+        fi
+    done < <(manifest_data)
+}
+
 # tool_present <id>
 # True when the tool's executable is on PATH. That executable is not always the
 # manifest id: Debian calls it fdfind, btop, codium and yq-of-a-different-kind.
@@ -972,7 +1018,15 @@ fetch_file() {  # fetch_file <url> <dest>
     fi
     if (( rc != 0 )); then
         rm -f -- "$dest"
-        log_err "download failed (exit $rc): $url"
+        # 77 is curl's CURLE_SSL_CACERT_BADFILE. It means there is no usable
+        # trust store, which is the state of every minimal image, and the raw
+        # exit code sends people looking for a network problem instead.
+        if (( rc == 77 )); then
+            log_err "no CA certificate bundle: cannot verify $url"
+            log_err "      install the trust store: ${CA_PACKAGES[$PKG_MANAGER]:-ca-certificates}"
+        else
+            log_err "download failed (exit $rc): $url"
+        fi
         return 1
     fi
     # A server that closes the connection early can still exit 0 and leave a
@@ -2581,6 +2635,51 @@ section_git() {
 # install_manifest_tool <id>
 # One tool, whatever its method. Prints nothing; the return value says whether
 # it is now installed.
+# Is a package name in the repository index? 0 = yes, 1 = definitely no,
+# 2 = cannot tell. Asked only after an install has already failed, so it never
+# costs anything on a run where the package installs cleanly, and it is what
+# lets the failure say "this archive does not have it" instead of leaving the
+# user wondering whether the network dropped.
+pkg_available() {  # pkg_available <pkg>
+    local pkg="$1"
+    case "$PKG_MANAGER" in
+        apt)
+            # apt-cache policy succeeds for a name it has never heard of, so the
+            # Candidate line is the only thing that means anything.
+            apt-cache policy "$pkg" 2>/dev/null | grep -qE '^  Candidate: [^ ]' && return 0
+            return 1
+            ;;
+        pacman)
+            # -S reads the sync database, so this is "would pacman be able to
+            # install it", not "is it already installed".
+            pacman -Si "$pkg" >/dev/null 2>&1 && return 0
+            return 1
+            ;;
+        apk)
+            # Not `apk search -q -x`: it exits 0 for a name that matches nothing,
+            # which would report every failure as "the archive does not have it".
+            apk info -a "$pkg" >/dev/null 2>&1 && return 0
+            return 1
+            ;;
+        zypper)
+            zypper --non-interactive info "$pkg" >/dev/null 2>&1 && return 0
+            return 1
+            ;;
+        dnf|yum)
+            # dnf exits 0 even when the name matched nothing, so look at stdout.
+            if "${PKG_MANAGER}" list --available "$pkg" 2>/dev/null | grep -q "^${pkg%%[-.]*}"; then
+                return 0
+            fi
+            return 1
+            ;;
+        *)
+            # Not verified against a real package manager. Claiming "not in the
+            # archive" on a guess would be worse than the generic message.
+            return 2
+            ;;
+    esac
+}
+
 install_manifest_tool() {  # install_manifest_tool <id>
     local id="$1" method arg pkg note
 
@@ -2617,7 +2716,22 @@ install_manifest_tool() {  # install_manifest_tool <id>
                 return 0
             fi
             if ! pkg_install "$pkg"; then
-                log_warn "$id: '$pkg' could not be installed via $PKG_MANAGER"
+                # Two very different problems land here. Saying which one is the
+                # difference between "this archive has no helm" and "the install
+                # failed", and only the first is fixed by editing the manifest
+                # rather than by retrying.
+                local avail=0
+                pkg_available "$pkg" || avail=$?
+                if (( avail == 1 )); then
+                    # One line, not three. On a distribution that packages few of
+                    # these this fires a dozen times in a row, and advice repeated
+                    # a dozen times stops being advice. The manifest note is not
+                    # printed here: that column describes the tool ("readable
+                    # diffs"), and a description is not a remedy.
+                    log_warn "$id: '$pkg' is not in the ${OS_ID:-system} ${OS_VERSION:-} archive; take it from its own release page"
+                else
+                    log_warn "$id: '$pkg' could not be installed via $PKG_MANAGER"
+                fi
                 return 1
             fi
             log_ok "$id ($pkg)"
@@ -2984,6 +3098,7 @@ validate_sections() {
             log_warn "or use --extra=<package> to install something by name"
         fi
     else
+        validate_manifest
         # Catch a typo in --extras early: it would otherwise silently select
         # nothing. No pipes here: `producer | head -1` can be killed by SIGPIPE
         # under `set -o pipefail` and would make a valid profile look unknown.
