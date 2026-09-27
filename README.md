@@ -15,7 +15,7 @@ declarative manifest of dev tools.
 
 | Section   | What you get                                                                    |
 |-----------|---------------------------------------------------------------------------------|
-| `deps`    | `git curl wget unzip tar gzip` + `fontconfig`                                     |
+| `deps`    | the `deps` group of the manifest + `fontconfig`                                   |
 | `fonts`   | MesloLGS NF and/or Hack Nerd Font, plus a rebuilt font cache                      |
 | `zsh`     | `zsh`, Oh My Zsh, a starter `~/.zshrc`                                            |
 | `plugins` | `zsh-autosuggestions`, `zsh-history-substring-search`, `zsh-syntax-highlighting`   |
@@ -44,7 +44,10 @@ id | group | method | arg | package mapping | note | probe
 zoxide|daily|pkg|-|pacman=zoxide,apt=zoxide,dnf=zoxide,zypper=zoxide,apk=zoxide,brew=zoxide|cd that learns your habits|-
 ```
 
-* `group` — what `--extras=<group>` selects: `deps daily k8s terminal secrets gui ai`
+* `group` — what `--extras=<group>` selects: `deps daily k8s terminal secrets gui ai`.
+  The `deps` group is special: the `deps` section installs it on every run without
+  you asking for a profile, which is what makes the manifest the single place that
+  says what a new machine needs.
 * `method` — `pkg` (resolve the name), `npm`, `uv`, `cargo`, `official` (run an
   installer), or `none` (not a package: listed so the inventory stays complete,
   but a dedicated section installs it)
@@ -134,6 +137,18 @@ around it looped forever. Those are gone. The rules now are:
 
   Re-running rewrites that block in place, so there are no duplicated
   completions or aliases. Delete the block to get your original file back.
+
+  Inside the block, each contribution is tagged with the section that wrote it:
+
+  ```
+  # [my-shell:history] shell history tuning
+  ```
+
+  That tag is what makes the block repairable. A run that only re-runs one
+  section rewrites that one part and leaves the others exactly where they were,
+  and a part that has since become invalid gets fixed the next time its section
+  runs. A block written by a version predating the tags is left untouched rather
+  than guessed at, with the one `sed` command needed to remove it.
 * **Package-owned files are never touched** (`dpkg -S`, `rpm -qf`, `pacman -Qo`).
 * **Distribution shell configs are adopted, not replaced.** If your `~/.zshrc`
   sources something from `/usr/share` (CachyOS, Arch, Ubuntu, Fedora …), the
@@ -177,6 +192,21 @@ the problem: a font or a login-shell change that needs `sudo` prints the exact
 command to run yourself, and a download failure prints the URL. Both still count
 as problems in the exit status.
 
+A message that says what went wrong is worth more than one that says it failed.
+The two that come up most often are called out by name:
+
+* **GitHub rate limits.** Resolving "the latest release" uses the GitHub API,
+  which allows 60 unauthenticated requests an hour *per IP* — and every machine
+  behind the same NAT shares that budget. When it runs out the script says so and
+  names the flag that skips the lookup, instead of failing with a generic message
+  that sends you looking for a network problem that does not exist. One answer is
+  cached per repository per run, so installing both nerd fonts costs one request
+  and not two.
+* **A command that is not installed.** `chsh`, for instance, is in `util-linux` on
+  Debian, `shadow` on Alpine and `shadow-utils` on RHEL. "run `sudo chsh`
+  yourself" is useless advice when `chsh` is not there, so the script names the
+  package that provides it.
+
 ## Notes and deliberate choices
 
 * **`kube-ps1` is opt-in (`--kube-ps1`) and off by default.** Powerlevel10k has a
@@ -189,6 +219,12 @@ as problems in the exit status.
 * **`~/.p10k.zsh` is never clobbered** unless you pass `--replace-p10k`; an
   existing one is left alone so `p10k configure` stays authoritative. A backup is
   taken before any replacement.
+* **The prompt is checked for what it needs.** The bundled `config_files/p10k.zsh`
+  shows the git status, which comes from `vcs_info`. Most distributions build
+  that into `zsh`; Alpine ships it as a separate `zsh-vcs` package. Without it the
+  prompt still appears and prints `vcs_info: function definition file not found`
+  on every redraw, which most people read as part of the theme. The `theme`
+  section checks for it and says so once.
 * **Backups** go to `${XDG_STATE_HOME:-~/.local/state}/my-shell/backups/`
   (`--backup-dir` to change). `/etc/passwd` is backed up before `chsh`.
 * **Binaries** go to `/usr/local/bin` when it is writable, otherwise to
